@@ -1,0 +1,712 @@
+---
+title: ""
+output: html_document
+---
+  
+ 
+```{r , echo=FALSE, include = FALSE}
+library(rvest)
+library(tidyverse)
+library(stringi)
+library(readxl)
+library(janitor)
+library(DT)
+library(xml2)
+library(lubridate) 
+library(RSelenium)
+library(httr2)
+
+# https://vikyd.github.io/download-chromium-history-version/#/
+# https://commondatastorage.googleapis.com/chromium-browser-snapshots/index.html?prefix=Win/1047731/
+
+
+# download crome-win-zip, unpack, execute
+#binman::list_versions("chromedriver")
+#library(wdman)
+#chromecommand<-chrome(retcommand = T, verbsoe = F, check = F)
+#chromecommand
+#C:\Users\Jochen\AppData\Local\binman\binman_chromedriver\win32
+#https://www.youtube.com/watch?v=BnY4PZyL9cg
+
+#https://chromedriver.chromium.org/downloads
+
+date1 <- today()-7
+date2 <- today()
+
+
+get_ssrn <- function(index) {
+  cat("Scraping index:", index, "\n")
+  str_c("https://api.ssrn.com/content/v1/bindings/204/papers?index=", 
+        index, "&count=200&sort=0") %>%
+    request() %>%
+    req_perform() %>%
+    resp_body_json(simplifyVector = TRUE) %>%
+    pluck("papers") %>%
+    as_tibble() 
+}
+
+df <- map_dfr(seq(0, 200, by = 200), get_ssrn)
+
+
+ssrn <- as.data.frame(df) %>% 
+  mutate(
+    title = title,
+    authors = authors,
+    info = reference,
+    affiliation = affiliations,
+    date = approved_date,
+    url2 = url
+         ) %>% 
+  unnest() %>% 
+  mutate(authors = paste0(first_name," ",last_name)) %>% 
+  select(title, authors, affiliation, info, date, url2) %>% 
+  group_by(title) %>% 
+  mutate(authors = paste0(authors, collapse = "; ")) %>% ungroup() %>% 
+  group_by(url2) %>% 
+  filter(row_number() == 1) %>% ungroup() %>% 
+  separate(date,into=c("day","mon","year"),sep = " ") %>% 
+  mutate(mon = match(mon,month.abb)) %>% 
+  mutate(date = paste(year, mon, day,sep="-")) %>% 
+  mutate(date = as.Date(date)) %>% 
+  select(-year,-mon,-day)  
+
+
+# Combine
+data_ssrn_acc <- ssrn %>% filter(date >= date1) %>% filter(date <= date2)    %>% 
+  mutate(title = paste0("<a href='",url2,"' target='_blank'>",title,"</a>")) %>% 
+  select(-url2) %>% 
+  select(-date)
+
+
+
+# Tandfonline Journals
+journal_codes <- c("rabr20", "rear20", "racc20", "raie20")
+tandfonline = data.frame() 
+for(c in journal_codes) {
+
+rD <- rsDriver(
+  browser = "chrome",
+  chromever = "119.0.6045.105", # ***IMPORTANT: check local chrome version***
+  verbose = FALSE,
+)
+remDr <- rD[["client"]]  
+    
+url <- paste0("https://www.tandfonline.com/action/showAxaArticles?journalCode=",c) 
+
+remDr$navigate(url)
+  Sys.sleep(5)
+  html <- remDr$getPageSource()[[1]]
+
+webpage <- read_html(html)
+title <- webpage %>% 
+  html_nodes("div.art_title.linkable") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(title)[1] <- "title"
+authors <- webpage %>% 
+  html_nodes("div.tocAuthors.articleEntryAuthor") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(authors)[1] <- "authors"  
+link <- webpage %>% 
+  html_nodes("a.ref.nowrap") %>% 
+  xml_attr("href") %>%
+  data.frame()
+colnames(link)[1] <- "link"
+link <- link %>% mutate(link = paste0("https://www.tandfonline.com",link))
+date <- webpage %>% 
+  html_nodes("div.tocEPubDate") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(date)[1] <- "date"
+date <- date %>%   separate(date,into=c("text","date"),sep = "Published online:") %>%  select(date) 
+ data <- cbind(title, link, date) %>% 
+  mutate(source = c) %>%
+  mutate(source = ifelse(source == "rabr20","ABR",source),
+         source = ifelse(source == "rear20","EAR",source),
+         source = ifelse(source == "racc20","AF",source),
+         source = ifelse(source == "raie20","AiE",source)
+         ) %>% 
+  mutate(date = gsub(" ", "", date)) %>% 
+  mutate(date = as.Date(date,"%d%b%Y")) %>%  
+  filter(title != "Correction") 
+data <- cbind(data,authors) 
+tandfonline = rbind(tandfonline , data)
+ remDr$close()
+ rD[["server"]]$stop()
+  system("taskkill /im java.exe /f", intern=FALSE, ignore.stdout=FALSE)
+
+}
+EAR <- tandfonline %>% filter(source == "EAR")
+ABR <- tandfonline %>% filter(source == "ABR")
+AF <- tandfonline %>%  filter(source == "AF")
+AiE <- tandfonline %>%  filter(source == "AiE")
+
+# Elsevier journals 
+journal_codes <- c("journal-of-accounting-and-economics","journal-of-accounting-and-public-policy","management-accounting-research","critical-perspectives-on-accounting","accounting-organizations-and-society")
+
+
+elsevier = data.frame() 
+for(c in journal_codes) {
+  
+rD <- rsDriver(
+  browser = "chrome",
+  chromever = "119.0.6045.105", # ***IMPORTANT: check local chrome version***
+  verbose = FALSE,
+)
+ 
+ 
+remDr <- rD[["client"]]  
+    
+url <- paste0("https://www.sciencedirect.com/journal/",c,"/articles-in-press") 
+
+remDr$navigate(url)
+  Sys.sleep(15)
+  html <- remDr$getPageSource()[[1]] 
+  
+webpage <- read_html(html)  
+title <- webpage %>% 
+  html_nodes("span.js-article-title") %>% 
+  html_text("title")  %>%
+  data.frame()
+colnames(title)[1] <- "title"
+authors <- webpage %>% 
+  html_nodes("div.text-s.u-clr-grey8.js-article__item__authors") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(authors)[1] <- "authors"
+link <- webpage %>% 
+  html_nodes("a.anchor.article-content-title.u-margin-xs-top.u-margin-s-bottom") %>% 
+  xml_attr("href")  %>%
+  data.frame()
+colnames(link)[1] <- "link"
+link <- link %>% mutate(link = paste0("https://www.sciencedirect.com/",link))
+date <- webpage %>% 
+  html_nodes("span.u-clr-grey8.u-text-italic.text-s.js-article-item-aip-date") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(date)[1] <- "date"
+date <- date %>%   separate(date,into=c("text","date"),sep = "Available online") %>%  select(date) 
+data <- cbind(title, link, date) %>% 
+  filter(title != "Acknowledgements") %>% 
+  filter(title != "Acknowledgement") %>%  
+  filter(title != "Call for Papers") %>%  
+  filter(title != "Call for paper") %>% 
+  filter(title != "Call for papers") %>% 
+  filter(title != "BIO") %>% 
+  filter(title != "Bio") %>% 
+  mutate(
+         drop=(ifelse(str_detect(title,"Prize Announcement"),1,0)),
+         drop=(ifelse(str_detect(title,"ANNOUNCEMENT"),1,drop)), 
+         drop=(ifelse(str_detect(title,"Announcement:"),1,drop)),
+          drop=(ifelse(str_detect(title,"Call for papers"),1,drop)),
+         drop=(ifelse(str_detect(title,"Biographies"),1,drop)),   
+         drop=(ifelse(str_detect(title,"Bios"),1,drop)),   
+         drop=(ifelse(str_detect(title,"BIOGRAPHIES"),1,drop)), 
+         drop=(ifelse(str_detect(link,"S1044500519300113"),1,drop)),
+         drop=(ifelse(str_detect(link,"S1044500520300184"),1,drop)), 
+         drop=(ifelse(str_detect(title,"ublisher"),1,drop))
+         )  %>% 
+  filter(drop == 0) %>% select(-drop)
+data <- cbind(data, authors) %>% 
+    mutate(source = c) %>%
+    mutate(source = ifelse(source == "journal-of-accounting-and-economics","JAE",source),
+         source = ifelse(source == "journal-of-accounting-and-public-policy","JAPP",source),
+         source = ifelse(source == "accounting-organizations-and-society","AOS",source),
+         source = ifelse(source == "management-accounting-research","MAR",source),
+         source = ifelse(source == "critical-perspectives-on-accounting","CPA",source)
+                            ) %>%
+  mutate(date = gsub(" ", "", date)) %>% 
+  mutate(date = as.Date(date,"%d%b%Y"))
+elsevier = rbind(elsevier , data)
+ remDr$close()
+ rD[["server"]]$stop()
+  system("taskkill /im java.exe /f", intern=FALSE, ignore.stdout=FALSE)
+}
+JAE <- elsevier %>% filter(source == "JAE")
+JAPP <- elsevier %>% filter(source == "JAPP")
+AOS <- elsevier %>% filter(source == "AOS")
+MAR <- elsevier %>% filter(source == "MAR")
+CPA <- elsevier %>% filter(source == "CPA")
+
+# allenpress
+journal_codes <- c("accounting-review", "jmar","accounting-horizons", "jata", "ajpt")
+allenpress = data.frame() 
+for(c in journal_codes) {
+########### TAR
+url <- paste0("https://meridian.allenpress.com/",c,"/publish-ahead-of-print")
+webpage <- read_html(url)
+title <- webpage %>% 
+  html_nodes("h5.al-title") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(title)[1] <- "title"
+authors <- webpage %>% 
+  html_nodes("div.al-authors-list") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(authors)[1] <- "authors"  
+link <- webpage %>% 
+  html_nodes("h5.al-title") %>% html_nodes("a") %>% 
+  xml_attr("href") %>%
+  data.frame()
+colnames(link)[1] <- "link"
+link <- link %>% mutate(link = paste0("https://meridian.allenpress.com",link))
+link <- link %>% filter(link != "https://meridian.allenpress.comhttp://aaajournals.org/doi/full/10.2308/accr-51520")
+date <- webpage %>% 
+  html_nodes("span.sri-date.al-pub-date") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(date)[1] <- "date"
+data <- cbind(title, authors, link, date) %>% 
+  mutate(source = c) %>%
+  mutate(source = ifelse(source == "accounting-review","TAR",source),
+         source = ifelse(source == "jmar","JMAR",source),
+         source = ifelse(source == "accounting-horizons","AH",source),
+         source = ifelse(source == "jata","JATA",source),
+         source = ifelse(source == "ajpt","AJPT",source)
+         ) %>% 
+  mutate(title = sub("^\\s+", "", title)) %>% 
+  mutate(authors = sub("^\\s+", "", authors)) %>% 
+  separate(date,into=c("mon","day","year"),sep = " ") %>% 
+  mutate(mon = match(mon,month.name)) %>% 
+  mutate(date = paste(year, mon, day,sep="-")) %>% 
+  mutate(date = as.Date(date)) %>% 
+  select(-year,-mon,-day)  
+allenpress = rbind(allenpress , data)
+}
+TAR <- allenpress %>% filter(source == "TAR")
+JMAR <- allenpress %>% filter(source == "JMAR") 
+AH <- allenpress %>% filter(source == "AH") 
+JATA <- allenpress %>% filter(source == "JATA") 
+AJPT <- allenpress %>% filter(source == "AJPT") 
+
+
+# Wiley
+
+
+rD <- rsDriver(
+  browser = "chrome",
+  chromever = "119.0.6045.105", # ***IMPORTANT: check local chrome version***
+  verbose = FALSE,
+)
+remDr <- rD[["client"]]
+
+
+journal_codes <- c("14685957")
+# Checjk: SMJ 10970266
+wiley = data.frame() 
+for(c in journal_codes) {
+
+url <- paste0("https://onlinelibrary.wiley.com/journal/",c,"?tabActivePane=")
+  
+remDr$navigate(url)
+ Sys.sleep(15)
+  html <- remDr$getPageSource()[[1]]
+  
+webpage <-  read_html(html) 
+title <- webpage %>% 
+  html_nodes("h3.issue-item__title.issue-item__title__en") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(title)[1] <- "title"
+authors <- webpage %>% 
+  html_nodes("div.loa.comma") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(authors)[1] <- "authors"
+link <- webpage %>% 
+  html_nodes("a.issue-item__title.visitable") %>% 
+  xml_attr("href")  %>%
+  data.frame()
+colnames(link)[1] <- "link"
+link <- link %>% mutate(link = paste0("https://onlinelibrary.wiley.com",link))
+date <- webpage %>% 
+  html_nodes("ul.rlist--inline.separator.issue-item__details") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(date)[1] <- "date"
+date <- date %>%   separate(date,into=c("text","date"),sep = "First Published:") %>%  select(date) %>% 
+  mutate(date = gsub("&nbsp", "", date)) 
+data <- cbind(title, link, date) %>% 
+    mutate(source = c) %>% 
+    mutate(source = ifelse(source == "14685957","JBFA",source),
+         source = ifelse(source == "19113846","CAR",source)
+         ) %>% 
+  mutate(date = sub("^\\s+", "", date)) %>% # delete leading space
+  separate(date,into=c("day","mon","year"),sep = " ") %>% 
+  mutate(mon = match(mon,month.name)) %>% 
+  mutate(date = paste(year, mon, day,sep="-")) %>% 
+  mutate(date = as.Date(date)) %>% 
+  select(-year,-mon,-day)  %>% 
+  mutate(drop=(ifelse(str_detect(title,"AMERICAN FINANCE ASSOCIATION"),1,0)),
+           drop=(ifelse(str_detect(title,"AMERICAN FINANCE ASSOCIATION"),1,drop)),
+         drop=(ifelse(str_detect(title,"Annual Membership"),1,drop)),
+         drop=(ifelse(str_detect(title,"Jean Tirole"),1,drop)),
+         drop=(ifelse(str_detect(title,"MISCELLANEA"),1,drop)),
+         drop=(ifelse(str_detect(title,"James M. Poterba"),1,drop)),
+         drop=(ifelse(str_detect(title,"ANNOUNCEMENT"),1,drop)),
+         drop=(ifelse(str_detect(title,"Report of the Executive Secretary"),1,drop)),
+         drop=(ifelse(str_detect(title,"ANNOUNCEMENTS"),1,drop)),
+         drop=(ifelse(str_detect(title,"Corrigendum"),1,drop)),
+         drop=(ifelse(str_detect(title,"Retracted"),1,drop)),
+         drop=(ifelse(str_detect(title,"Ad Hoc Reviewers"),1,drop))
+  ) %>% 
+  filter(drop == 0) %>% select(-drop)
+data <- cbind(data,authors)
+ wiley = rbind(wiley , data)
+ remDr$close()
+ rD[["server"]]$stop()
+  system("taskkill /im java.exe /f", intern=FALSE, ignore.stdout=FALSE)
+}
+
+
+#CAR
+journal_codes <- c(  "19113846")
+wiley2 = data.frame() 
+for(c in journal_codes) {
+
+rD <- rsDriver(
+  browser = "chrome",
+  chromever = "119.0.6045.105", # ***IMPORTANT: check local chrome version***
+  verbose = FALSE,
+)
+remDr <- rD[["client"]]  
+  
+url <- paste0("https://onlinelibrary.wiley.com/journal/",c,"?tabActivePane=")
+
+remDr$navigate(url)
+  Sys.sleep(15)
+  html <- remDr$getPageSource()[[1]]
+
+webpage <- read_html(html)
+title <- webpage %>% 
+  html_nodes("h3.issue-item__title.issue-item__title__en") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(title)[1] <- "title"
+authors <- webpage %>% 
+  html_nodes("div.loa.comma") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(authors)[1] <- "authors"
+link <- webpage %>% 
+  html_nodes("a.issue-item__title.visitable") %>% 
+  xml_attr("href")  %>%
+  data.frame()
+colnames(link)[1] <- "link"
+link <- link %>% mutate(link = paste0("https://onlinelibrary.wiley.com",link))
+date <- webpage %>% 
+  html_nodes("ul.rlist--inline.separator.issue-item__details") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(date)[1] <- "date"
+date <- date %>%   separate(date,into=c("text","date"),sep = "First Published:") %>%  select(date) %>% 
+  mutate(date = gsub("&nbsp", "", date)) 
+data <- cbind(title, link, date) %>% 
+    mutate(source = c) %>% 
+    mutate(source = ifelse(source == "14685957","JBFA",source),
+         source = ifelse(source == "19113846","CAR",source)
+         ) %>% 
+  mutate(date = sub("^\\s+", "", date)) %>% # delete leading space
+  separate(date,into=c("day","mon","year"),sep = " ") %>% 
+  mutate(mon = match(mon,month.name)) %>% 
+  mutate(date = paste(year, mon, day,sep="-")) %>% 
+  mutate(date = as.Date(date)) %>% 
+  select(-year,-mon,-day)  %>% 
+  mutate(drop=(ifelse(str_detect(title,"AMERICAN FINANCE ASSOCIATION"),1,0)),
+         drop=(ifelse(str_detect(title,"Annual Membership"),1,drop)),
+         drop=(ifelse(str_detect(title,"Jean Tirole"),1,drop)),
+         drop=(ifelse(str_detect(title,"MISCELLANEA"),1,drop)),
+         drop=(ifelse(str_detect(title,"James M. Poterba"),1,drop)),
+         drop=(ifelse(str_detect(title,"ISSUE INFORMATION"),1,drop)),
+         drop=(ifelse(str_detect(title,"Corrigendum"),1,drop)),
+         drop=(ifelse(str_detect(title,"Retracted"),1,drop)),
+         drop=(ifelse(str_detect(title,"AFA 2022"),1,drop)),
+         drop=(ifelse(str_detect(title,"ANNOUNCEMENT"),1,drop)),
+         drop=(ifelse(str_detect(title,"Corrections for Du"),1,drop)),
+         drop=(ifelse(str_detect(title,"Ad Hoc Reviewer"),1,drop)),
+         drop=(ifelse(str_detect(title,"Reviewer Recognition Program"),1,drop)),
+         drop=(ifelse(str_detect(title,"Report of the Executive Secretary"),1,drop)),
+         drop=(ifelse(str_detect(title,"ERRATUM"),1,drop)),
+         drop=(ifelse(str_detect(title,"ANNOUNCEMENTS"),1,drop)),
+         drop=(ifelse(str_detect(title,"Article Note/Editorial Note"),1,drop)),
+         drop=(ifelse(str_detect(title,"Ad Hoc Reviewers"),1,drop))
+  ) %>% 
+  filter(drop == 0) %>% select(-drop)
+data <- cbind(data,authors)
+wiley2 = rbind(wiley2 , data)
+ remDr$close()
+ rD[["server"]]$stop()
+  system("taskkill /im java.exe /f", intern=FALSE, ignore.stdout=FALSE)
+}
+
+wiley <- rbind(wiley2, wiley)
+
+JBFA <- wiley %>% filter(source == "JBFA")
+CAR <- wiley %>% filter(source == "CAR")
+
+
+# jar only
+rD <- rsDriver(
+  browser = "chrome",
+  chromever = "119.0.6045.105", # ***IMPORTANT: check local chrome version***
+  verbose = FALSE,
+)
+remDr <- rD[["client"]]    
+url <- paste0("https://onlinelibrary.wiley.com/journal/1475679x?tabActivePane=undefined")
+remDr$navigate(url)
+  Sys.sleep(15)
+  html <- remDr$getPageSource()[[1]]
+webpage <- read_html(html) 
+title <- webpage %>% 
+  html_nodes("h3.issue-item__title.issue-item__title__en") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(title)[1] <- "title"
+authors <- webpage %>% 
+  html_nodes("div.loa.comma") %>% 
+  html_text()  %>%
+  data.frame() %>% 
+  filter(row_number()<=10)
+colnames(authors)[1] <- "authors"
+link <- webpage %>% 
+  html_nodes("a.issue-item__title.visitable") %>% 
+  xml_attr("href")  %>%
+  data.frame()
+colnames(link)[1] <- "link"
+link <- link %>% mutate(link = paste0("https://onlinelibrary.wiley.com",link))
+date <- webpage %>% 
+  html_nodes("ul.rlist--inline.separator.issue-item__details") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(date)[1] <- "date"
+date <- date %>%   separate(date,into=c("text","date"),sep = "First Published:") %>%  select(date) %>% 
+  mutate(date = gsub("&nbsp", "", date)) 
+data <- cbind(title, link, date) %>% 
+  mutate(date = sub("^\\s+", "", date)) %>% # delete leading space
+  separate(date,into=c("day","mon","year"),sep = " ") %>% 
+  mutate(mon = match(mon,month.name)) %>% 
+  mutate(date = paste(year, mon, day,sep="-")) %>% 
+  mutate(date = as.Date(date)) %>% 
+  select(-year,-mon,-day)  %>% 
+  mutate(drop=(ifelse(str_detect(title,"Call for Papers"),1,0)),
+         drop=(ifelse(str_detect(title,"Request for Papers"),1,drop)),
+          drop=(ifelse(str_detect(title,"Excellence in Refereeing"),1,drop)),
+         drop=(ifelse(str_detect(title,"Issue Information"),1,drop))) %>%
+  filter(drop == 0) %>% select(-drop) %>%
+  mutate(source="JAR") %>% 
+  filter(row_number()<=10)
+JAR <- cbind(data,authors) 
+remDr$close()
+ rD[["server"]]$stop()
+  system("taskkill /im java.exe /f", intern=FALSE, ignore.stdout=FALSE)
+
+
+
+# Srpinger
+journal_codes <- c("11142")
+springer = data.frame() 
+for(c in journal_codes) {
+  url <- paste0("https://www.springer.com/journal/",c)
+  webpage <- read_html(url)
+  title <- webpage %>% 
+  html_nodes("article") %>% html_nodes("a") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(title)[1] <- "title"
+authors <- webpage %>% 
+  html_nodes("ul.c-author-list") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(authors)[1] <- "authors"
+link <- webpage %>% 
+  html_nodes("article") %>% html_nodes("a") %>% 
+  xml_attr("href")  %>%
+  data.frame()
+colnames(link)[1] <- "link"
+date <- webpage %>% 
+  html_nodes("ul.c-meta") %>% 
+  html_text()  %>%
+  data.frame()
+colnames(date)[1] <- "date"
+date <- date %>%   separate(date,into=c("text","date"),sep = "Published: ") %>%  select(date) 
+data <- qpcR:::cbind.na(title, authors, link, date) %>% 
+  filter(!is.na(authors)) %>% 
+  mutate(source = c) %>%
+  mutate(source = ifelse(source == "11142","RAST",source)) %>% 
+  mutate(date = sub("^\\s+", "", date)) %>%
+  mutate(date = gsub("[[:space:]]*$","",date)) %>% 
+  separate(date,into=c("day","mon","year"),sep = " ") %>% 
+  mutate(mon = match(mon,month.name)) %>% 
+  mutate(date = paste(year, mon, day,sep="-")) %>% 
+  mutate(date = as.Date(date)) %>% 
+  select(-year,-mon,-day)  
+springer = rbind(springer , data)
+}
+RAST <- springer %>% filter(source == "RAST")
+
+
+# AAAJ Reading the HTML code from the website
+url <- paste0("https://www.emerald.com/insight/publication/issn/0951-3574#earlycite")
+  webpage <- read_html(url)
+title <- webpage %>% 
+    html_nodes("h4.h4.mt-0.mb-2.font-serif") %>% 
+    html_text()  %>%
+    data.frame()
+  colnames(title)[1] <- "title"
+link <- webpage %>% 
+    html_nodes("h4.h4.mt-0.mb-2.font-serif") %>%   html_nodes("a") %>%
+    xml_attr("href") %>%
+    data.frame()
+  colnames(link)[1] <- "link"
+  link <- link %>% mutate(link = paste0("https://www.emerald.com/",link))
+AAAJ <- cbind(title, link) %>% 
+    mutate(source = "AAAJ")
+
+# Function --> webpage
+scraper1<- function(url){
+    webpage <- read_html(url) 
+   date <- webpage %>% 
+    html_nodes("span.intent_journal_publication_date") %>% 
+    html_text()  %>%
+    data.frame()
+  colnames(date)[1] <- "date"
+  date <- date %>%   separate(date,into=c("text","date"),sep = "publication date:") %>%  select(date) %>% 
+    mutate(date = sub("^\\s+", "", date)) %>%
+    separate(date,into=c("day","mon","year"),sep = " ") %>% 
+    mutate(mon = match(mon,month.name)) %>% 
+    mutate(date = paste(year, mon, day,sep="-")) %>% 
+    mutate(date = as.Date(date)) %>% 
+    select(-year,-mon,-day)  
+  authors <- webpage %>% 
+    html_nodes("a.contrib-search") %>% 
+    html_text()  
+  authors <- paste(authors[1],",",authors[2],",",authors[3],",",authors[4],",",authors[5],",",authors[6]) %>% data.frame() 
+  colnames(authors)[1] <- "authors"
+  authors <- authors %>% 
+    mutate(authors = gsub(", NA", "", authors))
+  table <- cbind(date,authors)
+}
+AAAJ <- AAAJ %>% 
+  mutate(c = purrr::map(AAAJ$link, scraper1 )) %>% 
+  unnest(col = c) 
+
+
+published <- rbind(ABR, AF, AH, AJPT, AiE, AOS, CAR,  CPA, EAR, JAR, JAE, JAPP, JATA,  JBFA, JMAR,  MAR, RAST, TAR, AAAJ ) %>% 
+    mutate(authors = sub("^\\s+", "", authors)) %>% 
+  filter(date >= date1) %>% filter(date <= date2) %>% 
+  mutate(title = paste0("<a href='",link,"' target='_blank'>",title,"</a>")) %>% 
+ select(-link,-date ) 
+
+
+  
+text <- paste0("New publications (online first) from ",date1," to ",date2)
+text3 <- paste0("New SSRN working papers (Accounting Research Network) from ",date1," to ",date2)
+
+
+
+
+
+
+```
+
+
+
+<br><br><br><br><br>  <br><br>
+
+<head>
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:site" content="@@updates_acc">
+<meta name="twitter:creator" content="@jochenpierk">
+<meta name="twitter:title" content="New Publications">
+<meta name="twitter:description" content="Weekly update of new publications and SSRN working papers.">
+<meta name="twitter:image" content="http://easys-online.com/wp-content/uploads/2021/03/pic_twitter-2.jpg" >
+
+
+
+<meta name="title" property="og:title" content="New Accounting Publications">
+<meta name="description" property="og:description" content="Weekly update of new accounting publications and SSRN working papers! Feel free to sign up via email. Enjoy reading!">
+<meta name="image" property="og:image" content="http://easys-online.com/wp-content/uploads/2021/03/pic_twitter-2.jpg">
+
+
+
+</head>
+
+<style>
+  .nav-pills>li>a {
+     color: black;
+     padding-left: 200px;
+     }
+  .nav-pills>li>a:hover, .nav-pills>li>a:focus, .nav-pills>li.active>a, .nav-pills>li.active>a:hover, .nav-pills>li.active>a:focus{
+     color: black;
+     }
+  .nav-pills > li:nth-of-type(2)>a {
+     color: black;
+      padding-left: 1px;
+      text-align: center;
+    }
+  .nav-pills > li:nth-of-type(2)>a:hover, .nav-pills > li:nth-of-type(2)>a:focus, .nav-pills > li:nth-of-type(2).active>a {
+     color: black;
+    
+     }
+  .nav-pills > li:nth-of-type(3)>a {
+     color: black;
+      padding-left: 1px;
+
+    }
+  .nav-pills > li:nth-of-type(3)>a:hover, .nav-pills > li:nth-of-type(2)>a:focus, .nav-pills > li:nth-of-type(2).active>a {
+     color: black;
+    }
+  </style>   
+    
+    
+  <style type="text/css">
+.main-container {
+  max-width: 70% !important;
+  margin: auto;
+}
+</style>  
+     
+
+<!-- Global site tag (gtag.js) - Google Analytics -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-ZGC80EMKSJ"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-ZGC80EMKSJ',{'anonymize_ip': true});
+</script>
+
+## Accounting Updates {.tabset .tabset-fade .tabset-pills }
+
+
+For a weekly update via email, please sign up [here](https://jochenpierk.github.io/acc_update/subscribe.html). [Previous weeks](https://jochenpierk.github.io/home/service2/). [Unsubscribe](mailto:acco.updates@gmail.com?Subject=Please%20unsubscribe%20me&Body=Hi%20Jochen%20Please%20delete%20me%20from%20the%20list%20Thanks.). 
+
+## New Publications   
+
+```{r, echo = FALSE,  results = "asis"}
+
+cat(text)
+
+datatable(published,escape = FALSE,  list(pageLength = 50))
+
+```
+Journals included: Accounting Auditing & Accountability Journal (AAAJ), Accounting and Business Research (ABR), Accounting Forum (AF), Accounting in Europe (AiE), Auditing: A Journal of Practice & Theory  (AJPT), Accounting Organization and Society (AOS), Accounting Horizon (AH), Contemporary Accounting Research (CAR), Critical Perspectives on Accounting (CPA), European Accounting Review (EAR), Journal of Accounting and Economics (JAE), Journal of Accounting and Public Policy (JAPP), Journal of Accounting Research (JAR), Journal of the American Taxation Association (JATA), Journal of Business Finance and Accounting (JBFA),  Journal of Mangement Accounting Research (JMAR), Management Accounting Research (MAR), Review of Accounting Studies (RAST), and The Accounting Review (TAR).
+
+
+
+## New SSRN Working Papers {.tabset .tabset-fade .tabset-pills}
+
+
+```{r, echo = FALSE,  results = "asis"}
+
+cat(text3)
+
+datatable(data_ssrn_acc, escape = FALSE,  list(pageLength = 100))
+```
+
+
+
+
